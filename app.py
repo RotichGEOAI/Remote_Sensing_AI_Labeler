@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image
 from skimage import measure, morphology
@@ -17,6 +18,11 @@ try:
     import rasterio
 except ImportError:  # pragma: no cover - optional at runtime
     rasterio = None
+
+try:
+    import laspy
+except ImportError:  # pragma: no cover - optional at runtime
+    laspy = None
 
 from streamlit_drawable_canvas import st_canvas
 
@@ -50,6 +56,8 @@ def init_state() -> None:
         "active_class": "Building",
         "canvas_key": 0,
         "canvas_object_count": 0,
+        "point_cloud": None,
+        "point_labels": [],
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -105,6 +113,70 @@ def normalise_bands(array: np.ndarray) -> np.ndarray:
     if output.shape[0] < 4:
         output = np.concatenate([output, np.repeat(output[-1:], 4 - output.shape[0], axis=0)])
     return output
+
+
+def synthetic_point_cloud() -> dict[str, Any]:
+    rng = np.random.default_rng(7)
+    n = 12000
+    x = rng.uniform(0, 500, n)
+    y = rng.uniform(0, 500, n)
+    ground = 98 + 0.012 * x + 0.008 * y + rng.normal(0, 0.18, n)
+    building = (x > 180) & (x < 285) & (y > 165) & (y < 300)
+    tree = ((x - 375) ** 2 + (y - 225) ** 2 < 70 ** 2) | ((x - 110) ** 2 + (y - 365) ** 2 < 48 ** 2)
+    z = ground + np.where(building, rng.uniform(7, 18, n), 0) + np.where(tree, rng.uniform(3, 14, n), 0)
+    classification = np.where(building, 6, np.where(tree, 5, 2)).astype("uint8")
+    return {"x": x, "y": y, "z": z, "intensity": rng.integers(20, 220, n), "classification": classification, "crs": "EPSG:32637", "name": "Synthetic urban LiDAR"}
+
+
+def load_point_cloud(file: Any) -> dict[str, Any]:
+    if laspy is None:
+        raise RuntimeError("Install laspy and lazrs to read LAS/LAZ files.")
+    cloud = laspy.read(io.BytesIO(file.getvalue()))
+    return {
+        "x": np.asarray(cloud.x),
+        "y": np.asarray(cloud.y),
+        "z": np.asarray(cloud.z),
+        "intensity": np.asarray(cloud.intensity),
+        "classification": np.asarray(cloud.classification),
+        "return_number": np.asarray(cloud.return_number),
+        "number_of_returns": np.asarray(cloud.number_of_returns),
+        "gps_time": np.asarray(cloud.gps_time) if "gps_time" in cloud.point_format.dimension_names else None,
+        "crs": str(cloud.header.parse_crs()) if cloud.header.parse_crs() else None,
+        "name": file.name,
+    }
+
+
+def normalise_heights(cloud: dict[str, Any]) -> np.ndarray:
+    """Use LAS ground class 2 when available; otherwise use the lowest 2% as a robust datum."""
+    ground = cloud["classification"] == 2
+    if ground.sum() >= 20:
+        return cloud["z"] - float(np.percentile(cloud["z"][ground], 2))
+    return cloud["z"] - float(np.percentile(cloud["z"], 2))
+
+
+def point_cloud_quality(cloud: dict[str, Any]) -> dict[str, Any]:
+    xy = np.column_stack([cloud["x"], cloud["y"]])
+    unique_xy = np.unique(np.round(xy, 3), axis=0).shape[0]
+    area = max((cloud["x"].max() - cloud["x"].min()) * (cloud["y"].max() - cloud["y"].min()), 1)
+    return {
+        "points": len(cloud["x"]),
+        "density": len(cloud["x"]) / area,
+        "duplicate_rate": 1 - unique_xy / len(xy),
+        "z_min": cloud["z"].min(),
+        "z_max": cloud["z"].max(),
+        "classified": float(np.mean(cloud["classification"] > 0)),
+        "ground": int(np.sum(cloud["classification"] == 2)),
+        "returns": int(np.max(cloud.get("number_of_returns", np.array([1])))),
+    }
+
+
+def point_cloud_csv(cloud: dict[str, Any], labels: list[dict[str, Any]]) -> bytes:
+    frame = pd.DataFrame({key: value for key, value in cloud.items() if isinstance(value, np.ndarray)})
+    frame["label"] = ""
+    for item in labels:
+        inside = (cloud["x"] >= item["xmin"]) & (cloud["x"] <= item["xmax"]) & (cloud["y"] >= item["ymin"]) & (cloud["y"] <= item["ymax"])
+        frame.loc[inside, "label"] = item["class"]
+    return frame.to_csv(index=False).encode()
 
 
 def rgb_image(scene: dict[str, Any], mode: str) -> np.ndarray:
@@ -206,6 +278,7 @@ init_state()
 with st.sidebar:
     st.markdown("## 🛰️ Scene setup")
     uploaded = st.file_uploader("Upload imagery", type=["tif", "tiff", "png", "jpg", "jpeg"])
+    point_uploaded = st.file_uploader("Upload LiDAR point cloud", type=["las", "laz"])
     if st.button("Use synthetic demo", use_container_width=True):
         st.session_state.scene = synthetic_scene()
         st.session_state.scene_name = "Synthetic coastal scene"
@@ -218,6 +291,13 @@ with st.sidebar:
         st.session_state.annotations = []
         st.session_state.suggestions = []
         record("Scene loaded", uploaded.name)
+    if point_uploaded is not None and (st.session_state.point_cloud is None or st.session_state.point_cloud["name"] != point_uploaded.name):
+        try:
+            st.session_state.point_cloud = load_point_cloud(point_uploaded)
+            st.session_state.point_labels = []
+            record("Point cloud loaded", point_uploaded.name)
+        except RuntimeError as error:
+            st.error(str(error))
     st.divider()
     st.markdown("### Classes")
     for item in st.session_state.classes:
@@ -243,13 +323,14 @@ height, width = scene["array"].shape[1:]
 st.title("Remote Sensing AI Labeller")
 st.caption("A transparent, human-in-the-loop workspace for turning imagery into training-ready labels.")
 
-metrics = st.columns(4)
+metrics = st.columns(5)
 metrics[0].metric("Scene", st.session_state.scene_name[:22])
 metrics[1].metric("Resolution", f"{width} × {height}")
 metrics[2].metric("Bands", scene["array"].shape[0])
 metrics[3].metric("Labels", len(st.session_state.annotations))
+metrics[4].metric("LiDAR points", f'{len(st.session_state.point_cloud["x"]):,}' if st.session_state.point_cloud else "—")
 
-tab_label, tab_ai, tab_review, tab_export = st.tabs(["🖍️ Annotate", "✨ AI assist", "✅ Review", "📦 Export"])
+tab_label, tab_ai, tab_lidar, tab_review, tab_export = st.tabs(["🖍️ Annotate", "✨ AI assist", "☁️ LiDAR", "✅ Review", "📦 Export"])
 
 with tab_label:
     control_col, image_col = st.columns([1, 3])
@@ -332,6 +413,61 @@ with tab_ai:
                 record("AI labels accepted", f"{len(st.session_state.suggestions)} candidates")
                 st.session_state.suggestions = []
                 st.rerun()
+
+with tab_lidar:
+    st.markdown("### LiDAR point-cloud labelling")
+    st.caption("Inspect geometry, returns, intensity, classification, density and vertical normalization before creating labels.")
+    cloud = st.session_state.point_cloud
+    if cloud is None:
+        st.info("Upload a LAS/LAZ file from the sidebar, or generate a synthetic urban LiDAR scene.")
+        if st.button("Use synthetic LiDAR demo"):
+            st.session_state.point_cloud = synthetic_point_cloud()
+            record("Point cloud loaded", "Synthetic urban LiDAR")
+            st.rerun()
+    else:
+        quality = point_cloud_quality(cloud)
+        qcols = st.columns(6)
+        qcols[0].metric("Points", f'{quality["points"]:,}')
+        qcols[1].metric("Density", f'{quality["density"]:.2f}/m²')
+        qcols[2].metric("Z range", f'{quality["z_min"]:.1f}–{quality["z_max"]:.1f}')
+        qcols[3].metric("Ground points", f'{quality["ground"]:,}')
+        qcols[4].metric("Classified", f'{quality["classified"]:.0%}')
+        qcols[5].metric("Duplicate XY", f'{quality["duplicate_rate"]:.2%}')
+        if quality["duplicate_rate"] > 0.02:
+            st.warning("High duplicate XY rate detected. Check flight-line overlap, scan angle, and point de-duplication before training.")
+        if quality["ground"] < 20:
+            st.warning("Fewer than 20 ASPRS ground-class points found. Height normalization uses the lowest 2% as a fallback datum.")
+        height_values = normalise_heights(cloud)
+        display_limit = min(len(cloud["x"]), 15000)
+        sample = np.random.default_rng(3).choice(len(cloud["x"]), display_limit, replace=False)
+        colour_mode = st.selectbox("Colour by", ["Normalized height", "Intensity", "LAS classification"], key="lidar_colour")
+        colour = height_values[sample] if colour_mode == "Normalized height" else cloud["intensity"][sample] if colour_mode == "Intensity" else cloud["classification"][sample]
+        fig = go.Figure(data=[go.Scatter3d(x=cloud["x"][sample], y=cloud["y"][sample], z=height_values[sample], mode="markers", marker={"size": 2, "color": colour, "colorscale": "Turbo", "opacity": 0.75, "colorbar": {"title": colour_mode}})])
+        fig.update_layout(height=560, margin={"l": 0, "r": 0, "t": 30, "b": 0}, scene={"xaxis_title": "Easting", "yaxis_title": "Northing", "zaxis_title": "Height above datum"})
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("#### Create a spatial label")
+        label_cols = st.columns(5)
+        with label_cols[0]:
+            pc_class = st.selectbox("Class", [item["name"] for item in st.session_state.classes], key="pc_class")
+        xmin, xmax = float(cloud["x"].min()), float(cloud["x"].max())
+        ymin, ymax = float(cloud["y"].min()), float(cloud["y"].max())
+        with label_cols[1]:
+            label_xmin = st.number_input("X min", value=xmin, min_value=xmin, max_value=xmax, key="label_xmin")
+        with label_cols[2]:
+            label_xmax = st.number_input("X max", value=xmax, min_value=xmin, max_value=xmax, key="label_xmax")
+        with label_cols[3]:
+            label_ymin = st.number_input("Y min", value=ymin, min_value=ymin, max_value=ymax, key="label_ymin")
+        with label_cols[4]:
+            label_ymax = st.number_input("Y max", value=ymax, min_value=ymin, max_value=ymax, key="label_ymax")
+        selected = (cloud["x"] >= label_xmin) & (cloud["x"] <= label_xmax) & (cloud["y"] >= label_ymin) & (cloud["y"] <= label_ymax)
+        st.write(f"Selected footprint contains **{int(selected.sum()):,} points**.")
+        if st.button("Save point-cloud label", type="primary") and selected.sum() > 0:
+            item = {"id": str(uuid.uuid4())[:8], "class": pc_class, "xmin": label_xmin, "xmax": label_xmax, "ymin": label_ymin, "ymax": label_ymax, "points": int(selected.sum()), "crs": cloud.get("crs"), "status": "Manual"}
+            st.session_state.point_labels.append(item)
+            record("Point-cloud label", f'{pc_class} ({item["points"]:,} points)')
+            st.success("Spatial label saved.")
+        if st.session_state.point_labels:
+            st.dataframe(pd.DataFrame(st.session_state.point_labels), use_container_width=True, hide_index=True)
         with reject_col:
             if st.button("Reject all candidates", use_container_width=True):
                 record("AI labels rejected", f"{len(st.session_state.suggestions)} candidates")
@@ -389,3 +525,17 @@ with tab_export:
             file_name="scene-preview.png",
             mime="image/png",
         )
+    if st.session_state.point_cloud is not None:
+        st.divider()
+        st.markdown("#### LiDAR labels")
+        st.caption(f"Source CRS: {st.session_state.point_cloud.get('crs') or 'Not declared'}")
+        if st.session_state.point_labels:
+            st.download_button(
+                "Download point labels as CSV",
+                point_cloud_csv(st.session_state.point_cloud, st.session_state.point_labels),
+                file_name="lidar-point-labels.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("Create at least one spatial LiDAR label in the LiDAR tab.")
